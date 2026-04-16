@@ -25,6 +25,391 @@
 
 // All open tabs — populated by fetchOpenTabs()
 let openTabs = [];
+let tabActivityByUrl = {};
+const ACTIVITY_STORAGE_KEY = 'tabActivityV1';
+const TAB_DEBT_STORAGE_KEY = 'tabDebtStateV1';
+const TAB_DEBT_SETTINGS_KEY = 'tabDebtSettingsV1';
+const TAB_DEBT_SCHEMA_VERSION = 1;
+const HIGH_DEBT_THRESHOLD = 65;
+let tabDebtState = { schemaVersion: TAB_DEBT_SCHEMA_VERSION, byUrl: {}, sitePreference: {}, updatedAt: Date.now() };
+let tabDebtSettings = { sortMode: 'size' };
+let tabDebtByTabId = {};
+let debtSummary = { highDebtCount: 0, avgDebt: 0 };
+
+const LANDING_PAGE_PATTERNS_BASE = [
+  {
+    hostname: 'mail.google.com',
+    test: (pathname, fullUrl) => {
+      return !fullUrl.includes('#inbox/') && !fullUrl.includes('#sent/') && !fullUrl.includes('#search/');
+    },
+  },
+  { hostname: 'x.com', pathExact: ['/home'] },
+  { hostname: 'www.linkedin.com', pathExact: ['/'] },
+  { hostname: 'github.com', pathExact: ['/'] },
+  { hostname: 'www.youtube.com', pathExact: ['/'] },
+];
+
+function normalizeActivityUrl(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return url || '';
+  }
+}
+
+function formatActiveTime(ms) {
+  const totalSeconds = Math.floor(Math.max(0, ms) / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+function getTabActiveMs(url) {
+  if (!url) return 0;
+  const key = normalizeActivityUrl(url);
+  return tabActivityByUrl[key] || 0;
+}
+
+function clampScore(value) {
+  return Math.max(0, Math.min(100, value));
+}
+
+function getDebtLevel(score) {
+  if (score >= HIGH_DEBT_THRESHOLD) return 'high';
+  if (score >= 35) return 'medium';
+  return 'low';
+}
+
+function getLandingPagePatterns() {
+  const localPatterns = typeof LOCAL_LANDING_PAGE_PATTERNS !== 'undefined' ? LOCAL_LANDING_PAGE_PATTERNS : [];
+  return [...LANDING_PAGE_PATTERNS_BASE, ...localPatterns];
+}
+
+function matchesLandingPattern(parsed, url, pattern) {
+  const hostnameMatch = pattern.hostname
+    ? parsed.hostname === pattern.hostname
+    : pattern.hostnameEndsWith
+      ? parsed.hostname.endsWith(pattern.hostnameEndsWith)
+      : false;
+
+  if (!hostnameMatch) return false;
+  if (pattern.test) return pattern.test(parsed.pathname, url);
+  if (pattern.pathPrefix) return parsed.pathname.startsWith(pattern.pathPrefix);
+  if (pattern.pathExact) return pattern.pathExact.includes(parsed.pathname);
+  return parsed.pathname === '/';
+}
+
+function isLandingPageUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const patterns = getLandingPagePatterns();
+    return patterns.some(pattern => matchesLandingPattern(parsed, url, pattern));
+  } catch {
+    return false;
+  }
+}
+
+function getDomainForScoring(url) {
+  if (!url) return '';
+  if (url.startsWith('file://')) return 'local-files';
+  try {
+    return new URL(url).hostname || '';
+  } catch {
+    return '';
+  }
+}
+
+function createDefaultDebtState() {
+  return {
+    schemaVersion: TAB_DEBT_SCHEMA_VERSION,
+    byUrl: {},
+    sitePreference: {},
+    updatedAt: Date.now(),
+  };
+}
+
+async function loadTabDebtState() {
+  try {
+    const data = await chrome.storage.local.get(TAB_DEBT_STORAGE_KEY);
+    const state = data[TAB_DEBT_STORAGE_KEY];
+    if (!state || typeof state !== 'object' || state.schemaVersion !== TAB_DEBT_SCHEMA_VERSION) {
+      tabDebtState = createDefaultDebtState();
+      return;
+    }
+    if (!state.byUrl || typeof state.byUrl !== 'object') state.byUrl = {};
+    if (!state.sitePreference || typeof state.sitePreference !== 'object') state.sitePreference = {};
+    tabDebtState = state;
+  } catch {
+    tabDebtState = createDefaultDebtState();
+  }
+}
+
+async function saveTabDebtState() {
+  tabDebtState.updatedAt = Date.now();
+  await chrome.storage.local.set({ [TAB_DEBT_STORAGE_KEY]: tabDebtState });
+}
+
+async function loadTabDebtSettings() {
+  try {
+    const data = await chrome.storage.local.get(TAB_DEBT_SETTINGS_KEY);
+    const settings = data[TAB_DEBT_SETTINGS_KEY];
+    if (settings && typeof settings === 'object' && (settings.sortMode === 'size' || settings.sortMode === 'debt')) {
+      tabDebtSettings = settings;
+    } else {
+      tabDebtSettings = { sortMode: 'size' };
+    }
+  } catch {
+    tabDebtSettings = { sortMode: 'size' };
+  }
+}
+
+async function saveTabDebtSettings() {
+  await chrome.storage.local.set({ [TAB_DEBT_SETTINGS_KEY]: tabDebtSettings });
+}
+
+function ensureDebtUrlEntry(normalizedUrl) {
+  if (!tabDebtState.byUrl[normalizedUrl]) {
+    tabDebtState.byUrl[normalizedUrl] = {
+      firstSeenAt: Date.now(),
+      lastSeenAt: Date.now(),
+      closed: 0,
+      kept: 0,
+      deferred: 0,
+    };
+  }
+  return tabDebtState.byUrl[normalizedUrl];
+}
+
+function getTabDebtUrlEntry(url) {
+  const normalizedUrl = normalizeActivityUrl(url || '');
+  if (!normalizedUrl) return null;
+  return tabDebtState.byUrl[normalizedUrl] || null;
+}
+
+function ensureSitePreferenceEntry(domain) {
+  if (!domain) return null;
+  if (!tabDebtState.sitePreference[domain]) {
+    tabDebtState.sitePreference[domain] = { kept: 0, closed: 0, deferred: 0 };
+  }
+  return tabDebtState.sitePreference[domain];
+}
+
+async function markTabsSeen(realTabs) {
+  const now = Date.now();
+  let changed = false;
+
+  for (const tab of realTabs) {
+    const normalizedUrl = normalizeActivityUrl(tab.url || '');
+    if (!normalizedUrl) continue;
+    const entry = ensureDebtUrlEntry(normalizedUrl);
+    if (!entry.firstSeenAt) {
+      entry.firstSeenAt = now;
+      changed = true;
+    }
+    if (entry.lastSeenAt !== now) {
+      entry.lastSeenAt = now;
+      changed = true;
+    }
+  }
+
+  if (changed) await saveTabDebtState();
+}
+
+async function recordDebtDecision(url, action) {
+  const normalizedUrl = normalizeActivityUrl(url || '');
+  if (!normalizedUrl) return;
+  const entry = ensureDebtUrlEntry(normalizedUrl);
+  const domain = getDomainForScoring(url || '');
+  const siteEntry = ensureSitePreferenceEntry(domain);
+
+  if (action === 'closed') {
+    entry.closed += 1;
+    if (siteEntry) siteEntry.closed += 1;
+  } else if (action === 'deferred') {
+    entry.deferred += 1;
+    if (siteEntry) siteEntry.deferred += 1;
+  } else if (action === 'kept') {
+    entry.kept += 1;
+    if (siteEntry) siteEntry.kept += 1;
+  } else {
+    return;
+  }
+
+  await saveTabDebtState();
+}
+
+async function recordDebtDecisionBatch(urls, action) {
+  const now = Date.now();
+  let changed = false;
+
+  for (const url of urls || []) {
+    const normalizedUrl = normalizeActivityUrl(url || '');
+    if (!normalizedUrl) continue;
+    const entry = ensureDebtUrlEntry(normalizedUrl);
+    const domain = getDomainForScoring(url || '');
+    const siteEntry = ensureSitePreferenceEntry(domain);
+
+    if (action === 'closed') {
+      entry.closed += 1;
+      if (siteEntry) siteEntry.closed += 1;
+      changed = true;
+    } else if (action === 'deferred') {
+      entry.deferred += 1;
+      if (siteEntry) siteEntry.deferred += 1;
+      changed = true;
+    } else if (action === 'kept') {
+      entry.kept += 1;
+      if (siteEntry) siteEntry.kept += 1;
+      changed = true;
+    }
+    entry.lastSeenAt = now;
+  }
+
+  if (changed) await saveTabDebtState();
+}
+
+function computeAdaptiveAdjustment(domain) {
+  const pref = tabDebtState.sitePreference[domain];
+  if (!pref) return 0;
+  const total = (pref.kept || 0) + (pref.closed || 0) + (pref.deferred || 0);
+  if (total < 5) return 0;
+
+  const keepRatio = (pref.kept || 0) / total;
+  const closeRatio = ((pref.closed || 0) + (pref.deferred || 0)) / total;
+
+  if (keepRatio >= 0.7) return -10;
+  if (closeRatio >= 0.7) return 10;
+  return 0;
+}
+
+function computeTabDebtScores(realTabs) {
+  tabDebtByTabId = {};
+  debtSummary = { highDebtCount: 0, avgDebt: 0 };
+  if (!realTabs || realTabs.length === 0) return;
+
+  const now = Date.now();
+  const urlCounts = {};
+  const domainCounts = {};
+
+  for (const tab of realTabs) {
+    const normalizedUrl = normalizeActivityUrl(tab.url || '');
+    if (normalizedUrl) urlCounts[normalizedUrl] = (urlCounts[normalizedUrl] || 0) + 1;
+    const domain = getDomainForScoring(tab.url || '');
+    if (domain) domainCounts[domain] = (domainCounts[domain] || 0) + 1;
+  }
+
+  let totalScore = 0;
+
+  for (const tab of realTabs) {
+    const normalizedUrl = normalizeActivityUrl(tab.url || '');
+    const domain = getDomainForScoring(tab.url || '');
+    const urlEntry = tabDebtState.byUrl[normalizedUrl] || {};
+
+    const inactivityMs = Math.max(0, now - (tab.lastAccessed || now));
+    const inactivityScore = clampScore((inactivityMs / (48 * 60 * 60 * 1000)) * 100);
+
+    const duplicateCount = urlCounts[normalizedUrl] || 1;
+    const duplicateScore = duplicateCount > 1
+      ? clampScore(((duplicateCount - 1) / 3) * 100)
+      : 0;
+
+    const firstSeenAt = urlEntry.firstSeenAt || now;
+    const ageMs = Math.max(0, now - firstSeenAt);
+    const ageScore = clampScore((ageMs / (7 * 24 * 60 * 60 * 1000)) * 100);
+
+    const homepageNoiseScore = isLandingPageUrl(tab.url || '') ? 100 : 0;
+
+    const domainCount = domainCounts[domain] || 0;
+    const domainOverloadScore = domainCount > 6
+      ? clampScore(((domainCount - 6) / 6) * 100)
+      : 0;
+
+    const adaptiveAdjustment = computeAdaptiveAdjustment(domain);
+
+    const weighted = (
+      0.30 * inactivityScore +
+      0.25 * duplicateScore +
+      0.20 * ageScore +
+      0.15 * homepageNoiseScore +
+      0.10 * domainOverloadScore +
+      adaptiveAdjustment
+    );
+
+    const score = Math.round(clampScore(weighted));
+    const level = getDebtLevel(score);
+
+    tabDebtByTabId[tab.id] = {
+      score,
+      level,
+      detail: {
+        inactivityScore: Math.round(inactivityScore),
+        duplicateScore: Math.round(duplicateScore),
+        ageScore: Math.round(ageScore),
+        homepageNoiseScore: Math.round(homepageNoiseScore),
+        domainOverloadScore: Math.round(domainOverloadScore),
+        adaptiveAdjustment,
+      },
+    };
+
+    totalScore += score;
+    if (score >= HIGH_DEBT_THRESHOLD) debtSummary.highDebtCount += 1;
+  }
+
+  debtSummary.avgDebt = Math.round(totalScore / realTabs.length);
+}
+
+function getTabDebtInfo(tab) {
+  if (!tab || typeof tab.id === 'undefined') return { score: 0, level: 'low', detail: null };
+  return tabDebtByTabId[tab.id] || { score: 0, level: 'low', detail: null };
+}
+
+function getDebtLabel(score) {
+  return `D${score}`;
+}
+
+function getGroupRiskClass(tabs) {
+  const levels = tabs.map(tab => getTabDebtInfo(tab).level);
+  if (levels.includes('high')) return 'has-risk-high';
+  if (levels.includes('medium')) return 'has-risk-medium';
+  return 'has-risk-low';
+}
+
+function formatDateTime(timestamp) {
+  if (!timestamp) return '—';
+  return new Date(timestamp).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+async function loadTabActivityStats() {
+  tabActivityByUrl = {};
+  try {
+    const data = await chrome.storage.local.get(ACTIVITY_STORAGE_KEY);
+    const state = data[ACTIVITY_STORAGE_KEY];
+    if (!state || typeof state !== 'object' || !state.byUrl) return;
+
+    for (const [url, entry] of Object.entries(state.byUrl)) {
+      const value = Number(entry && entry.totalActiveMs);
+      if (Number.isFinite(value) && value > 0) tabActivityByUrl[url] = value;
+    }
+
+    const current = state.currentSession;
+    if (current && current.normalizedUrl && current.startedAt) {
+      const liveMs = Math.max(0, Date.now() - current.startedAt);
+      tabActivityByUrl[current.normalizedUrl] = (tabActivityByUrl[current.normalizedUrl] || 0) + liveMs;
+    }
+  } catch {
+    tabActivityByUrl = {};
+  }
+}
 
 /**
  * fetchOpenTabs()
@@ -45,6 +430,7 @@ async function fetchOpenTabs() {
       title:    t.title,
       windowId: t.windowId,
       active:   t.active,
+      lastAccessed: t.lastAccessed,
       // Flag Tab Out's own pages so we can detect duplicate new tabs
       isTabOut: t.url === newtabUrl || t.url === 'chrome://newtab/',
     }));
@@ -106,6 +492,13 @@ async function closeTabsExact(urls) {
   const allTabs = await chrome.tabs.query({});
   const toClose = allTabs.filter(t => urlSet.has(t.url)).map(t => t.id);
   if (toClose.length > 0) await chrome.tabs.remove(toClose);
+  await fetchOpenTabs();
+}
+
+async function closeTabsByIds(tabIds) {
+  const ids = (tabIds || []).filter(id => typeof id === 'number');
+  if (ids.length === 0) return;
+  await chrome.tabs.remove(ids);
   await fetchOpenTabs();
 }
 
@@ -761,16 +1154,40 @@ function buildOverflowChips(hiddenTabs, urlCounts = {}) {
   const hiddenChips = hiddenTabs.map(tab => {
     const label    = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), '');
     const count    = urlCounts[tab.url] || 1;
+    const debtInfo = getTabDebtInfo(tab);
     const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
-    const chipClass = count > 1 ? ' chip-has-dupes' : '';
+    const chipClass = `${count > 1 ? ' chip-has-dupes' : ''} chip-risk-${debtInfo.level}`;
     const safeUrl   = (tab.url || '').replace(/"/g, '&quot;');
     const safeTitle = label.replace(/"/g, '&quot;');
+    const debtEntry = getTabDebtUrlEntry(tab.url);
+    const firstSeenAt = debtEntry && debtEntry.firstSeenAt ? debtEntry.firstSeenAt : '';
+    const healthScore = Math.max(0, 100 - debtInfo.score);
+    const detail = debtInfo.detail || {};
+    const inactivityScore = detail.inactivityScore || 0;
+    const duplicateScore = detail.duplicateScore || 0;
+    const ageScore = detail.ageScore || 0;
+    const homepageNoiseScore = detail.homepageNoiseScore || 0;
+    const domainOverloadScore = detail.domainOverloadScore || 0;
+    const adaptiveAdjustment = detail.adaptiveAdjustment || 0;
+    const activeMs = getTabActiveMs(tab.url);
     let domain = '';
     try { domain = new URL(tab.url).hostname; } catch {}
     const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
-    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
+    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}"
+      data-tooltip-tab-title="${safeTitle}"
+      data-debt-score="${debtInfo.score}"
+      data-health-score="${healthScore}"
+      data-opened-at="${firstSeenAt}"
+      data-active-ms="${activeMs}"
+      data-inactivity-score="${inactivityScore}"
+      data-duplicate-score="${duplicateScore}"
+      data-age-score="${ageScore}"
+      data-homepage-score="${homepageNoiseScore}"
+      data-domain-overload-score="${domainOverloadScore}"
+      data-adaptive-adjustment="${adaptiveAdjustment}">
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
       <span class="chip-text">${label}</span>${dupeTag}
+      ${activeMs > 0 ? `<span class="chip-activity" title="累计活跃时长：${formatActiveTime(activeMs)}">${formatActiveTime(activeMs)}</span>` : ''}
       <div class="chip-actions">
         <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
@@ -805,6 +1222,7 @@ function renderDomainCard(group) {
   const tabCount  = tabs.length;
   const isLanding = group.domain === '__landing-pages__';
   const stableId  = 'domain-' + group.domain.replace(/[^a-z0-9]/g, '-');
+  const riskClass = getGroupRiskClass(tabs);
 
   // Count duplicates (exact URL match)
   const urlCounts = {};
@@ -842,16 +1260,40 @@ function renderDomainCard(group) {
       if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
     } catch {}
     const count    = urlCounts[tab.url];
+    const debtInfo = getTabDebtInfo(tab);
     const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
-    const chipClass = count > 1 ? ' chip-has-dupes' : '';
+    const chipClass = `${count > 1 ? ' chip-has-dupes' : ''} chip-risk-${debtInfo.level}`;
     const safeUrl   = (tab.url || '').replace(/"/g, '&quot;');
     const safeTitle = label.replace(/"/g, '&quot;');
+    const debtEntry = getTabDebtUrlEntry(tab.url);
+    const firstSeenAt = debtEntry && debtEntry.firstSeenAt ? debtEntry.firstSeenAt : '';
+    const healthScore = Math.max(0, 100 - debtInfo.score);
+    const detail = debtInfo.detail || {};
+    const inactivityScore = detail.inactivityScore || 0;
+    const duplicateScore = detail.duplicateScore || 0;
+    const ageScore = detail.ageScore || 0;
+    const homepageNoiseScore = detail.homepageNoiseScore || 0;
+    const domainOverloadScore = detail.domainOverloadScore || 0;
+    const adaptiveAdjustment = detail.adaptiveAdjustment || 0;
+    const activeMs = getTabActiveMs(tab.url);
     let domain = '';
     try { domain = new URL(tab.url).hostname; } catch {}
     const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
-    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
+    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}"
+      data-tooltip-tab-title="${safeTitle}"
+      data-debt-score="${debtInfo.score}"
+      data-health-score="${healthScore}"
+      data-opened-at="${firstSeenAt}"
+      data-active-ms="${activeMs}"
+      data-inactivity-score="${inactivityScore}"
+      data-duplicate-score="${duplicateScore}"
+      data-age-score="${ageScore}"
+      data-homepage-score="${homepageNoiseScore}"
+      data-domain-overload-score="${domainOverloadScore}"
+      data-adaptive-adjustment="${adaptiveAdjustment}">
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
       <span class="chip-text">${label}</span>${dupeTag}
+      ${activeMs > 0 ? `<span class="chip-activity" title="累计活跃时长：${formatActiveTime(activeMs)}">${formatActiveTime(activeMs)}</span>` : ''}
       <div class="chip-actions">
         <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
@@ -878,7 +1320,7 @@ function renderDomainCard(group) {
   }
 
   return `
-    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-domain-id="${stableId}">
+    <div class="mission-card domain-card ${riskClass}" data-domain-id="${stableId}">
       <div class="status-bar"></div>
       <div class="mission-content">
         <div class="mission-top">
@@ -1025,43 +1467,20 @@ async function renderStaticDashboard() {
   const dateEl     = document.getElementById('dateDisplay');
   if (greetingEl) greetingEl.textContent = getGreeting();
   if (dateEl)     dateEl.textContent     = getDateDisplay();
+  await loadTabDebtSettings();
 
   // --- Fetch tabs ---
   await fetchOpenTabs();
+  await loadTabActivityStats();
   const realTabs = getRealTabs();
+  await loadTabDebtState();
+  await markTabsSeen(realTabs);
+  computeTabDebtScores(realTabs);
 
   // --- Group tabs by domain ---
   // Landing pages (Gmail inbox, Twitter home, etc.) get their own special group
   // so they can be closed together without affecting content tabs on the same domain.
-  const LANDING_PAGE_PATTERNS = [
-    { hostname: 'mail.google.com', test: (p, h) =>
-        !h.includes('#inbox/') && !h.includes('#sent/') && !h.includes('#search/') },
-    { hostname: 'x.com',               pathExact: ['/home'] },
-    { hostname: 'www.linkedin.com',    pathExact: ['/'] },
-    { hostname: 'github.com',          pathExact: ['/'] },
-    { hostname: 'www.youtube.com',     pathExact: ['/'] },
-    // Merge personal patterns from config.local.js (if it exists)
-    ...(typeof LOCAL_LANDING_PAGE_PATTERNS !== 'undefined' ? LOCAL_LANDING_PAGE_PATTERNS : []),
-  ];
-
-  function isLandingPage(url) {
-    try {
-      const parsed = new URL(url);
-      return LANDING_PAGE_PATTERNS.some(p => {
-        // Support both exact hostname and suffix matching (for wildcard subdomains)
-        const hostnameMatch = p.hostname
-          ? parsed.hostname === p.hostname
-          : p.hostnameEndsWith
-            ? parsed.hostname.endsWith(p.hostnameEndsWith)
-            : false;
-        if (!hostnameMatch) return false;
-        if (p.test)       return p.test(parsed.pathname, url);
-        if (p.pathPrefix) return parsed.pathname.startsWith(p.pathPrefix);
-        if (p.pathExact)  return p.pathExact.includes(parsed.pathname);
-        return parsed.pathname === '/';
-      });
-    } catch { return false; }
-  }
+  const landingPagePatterns = getLandingPagePatterns();
 
   domainGroups = [];
   const groupMap    = {};
@@ -1089,7 +1508,7 @@ async function renderStaticDashboard() {
 
   for (const tab of realTabs) {
     try {
-      if (isLandingPage(tab.url)) {
+      if (isLandingPageUrl(tab.url)) {
         landingTabs.push(tab);
         continue;
       }
@@ -1124,8 +1543,8 @@ async function renderStaticDashboard() {
 
   // Sort: landing pages first, then domains from landing page sites, then by tab count
   // Collect exact hostnames and suffix patterns for priority sorting
-  const landingHostnames = new Set(LANDING_PAGE_PATTERNS.map(p => p.hostname).filter(Boolean));
-  const landingSuffixes = LANDING_PAGE_PATTERNS.map(p => p.hostnameEndsWith).filter(Boolean);
+  const landingHostnames = new Set(landingPagePatterns.map(p => p.hostname).filter(Boolean));
+  const landingSuffixes = landingPagePatterns.map(p => p.hostnameEndsWith).filter(Boolean);
   function isLandingDomain(domain) {
     if (landingHostnames.has(domain)) return true;
     return landingSuffixes.some(s => domain.endsWith(s));
@@ -1139,6 +1558,12 @@ async function renderStaticDashboard() {
     const bIsPriority = isLandingDomain(b.domain);
     if (aIsPriority !== bIsPriority) return aIsPriority ? -1 : 1;
 
+    if (tabDebtSettings.sortMode === 'debt') {
+      const aAvg = a.tabs.reduce((sum, tab) => sum + getTabDebtInfo(tab).score, 0) / Math.max(1, a.tabs.length);
+      const bAvg = b.tabs.reduce((sum, tab) => sum + getTabDebtInfo(tab).score, 0) / Math.max(1, b.tabs.length);
+      if (bAvg !== aAvg) return bAvg - aAvg;
+    }
+
     return b.tabs.length - a.tabs.length;
   });
 
@@ -1150,7 +1575,19 @@ async function renderStaticDashboard() {
 
   if (domainGroups.length > 0 && openTabsSection) {
     if (openTabsSectionTitle) openTabsSectionTitle.textContent = 'Open tabs';
-    openTabsSectionCount.innerHTML = `${domainGroups.length} domain${domainGroups.length !== 1 ? 's' : ''} &nbsp;&middot;&nbsp; <button class="action-btn close-tabs" data-action="close-all-open-tabs" style="font-size:11px;padding:3px 10px;">${ICONS.close} Close all ${realTabs.length} tabs</button>`;
+    const sortButtonText = tabDebtSettings.sortMode === 'debt' ? 'Sort by size' : 'Sort by debt';
+    const highDebtButton = debtSummary.highDebtCount > 0
+      ? `<button class="action-btn close-tabs section-header-action" data-action="close-high-debt-tabs">${ICONS.close} Close high debt (${debtSummary.highDebtCount})</button>`
+      : '';
+
+    openTabsSectionCount.innerHTML = `
+      <span class="section-count-text">${domainGroups.length} domain${domainGroups.length !== 1 ? 's' : ''} · Avg D${debtSummary.avgDebt}</span>
+      <span class="section-count-actions">
+        <button class="action-btn section-header-action" data-action="toggle-debt-sort">${sortButtonText}</button>
+        <button class="action-btn close-tabs section-header-action" data-action="close-all-open-tabs">${ICONS.close} Close all ${realTabs.length} tabs</button>
+        ${highDebtButton}
+      </span>
+    `;
     openTabsMissionsEl.innerHTML = domainGroups.map(g => renderDomainCard(g)).join('');
     openTabsSection.style.display = 'block';
   } else if (openTabsSection) {
@@ -1170,6 +1607,35 @@ async function renderStaticDashboard() {
 
 async function renderDashboard() {
   await renderStaticDashboard();
+}
+
+let isRefreshingDashboard = false;
+let refreshQueued = false;
+let lastRefreshAt = 0;
+
+async function refreshDashboardNow() {
+  if (isRefreshingDashboard) {
+    refreshQueued = true;
+    return;
+  }
+
+  isRefreshingDashboard = true;
+  try {
+    await renderDashboard();
+    lastRefreshAt = Date.now();
+  } finally {
+    isRefreshingDashboard = false;
+    if (refreshQueued) {
+      refreshQueued = false;
+      await refreshDashboardNow();
+    }
+  }
+}
+
+function requestDashboardRefresh() {
+  const now = Date.now();
+  if (now - lastRefreshAt < 400) return;
+  void refreshDashboardNow();
 }
 
 
@@ -1217,7 +1683,38 @@ document.addEventListener('click', async (e) => {
   // ---- Focus a specific tab ----
   if (action === 'focus-tab') {
     const tabUrl = actionEl.dataset.tabUrl;
-    if (tabUrl) await focusTab(tabUrl);
+    if (tabUrl) {
+      await focusTab(tabUrl);
+      await recordDebtDecision(tabUrl, 'kept');
+    }
+    return;
+  }
+
+  // ---- Toggle group sorting mode ----
+  if (action === 'toggle-debt-sort') {
+    tabDebtSettings.sortMode = tabDebtSettings.sortMode === 'debt' ? 'size' : 'debt';
+    await saveTabDebtSettings();
+    await renderDashboard();
+    showToast(tabDebtSettings.sortMode === 'debt' ? 'Sorted by debt score' : 'Sorted by tab count');
+    return;
+  }
+
+  // ---- Close high debt tabs ----
+  if (action === 'close-high-debt-tabs') {
+    const realTabs = getRealTabs();
+    const highDebtTabs = realTabs.filter(tab => getTabDebtInfo(tab).score >= HIGH_DEBT_THRESHOLD);
+    if (highDebtTabs.length === 0) {
+      showToast('No high debt tabs');
+      return;
+    }
+
+    const urls = highDebtTabs.map(tab => tab.url).filter(Boolean);
+    const ids = highDebtTabs.map(tab => tab.id).filter(id => typeof id === 'number');
+    await recordDebtDecisionBatch(urls, 'closed');
+    await closeTabsByIds(ids);
+    playCloseSound();
+    showToast(`Closed ${ids.length} high debt tabs`);
+    await renderDashboard();
     return;
   }
 
@@ -1230,7 +1727,10 @@ document.addEventListener('click', async (e) => {
     // Close the tab in Chrome directly
     const allTabs = await chrome.tabs.query({});
     const match   = allTabs.find(t => t.url === tabUrl);
-    if (match) await chrome.tabs.remove(match.id);
+    if (match) {
+      await recordDebtDecision(tabUrl, 'closed');
+      await chrome.tabs.remove(match.id);
+    }
     await fetchOpenTabs();
 
     playCloseSound();
@@ -1274,6 +1774,7 @@ document.addEventListener('click', async (e) => {
     // Save to chrome.storage.local
     try {
       await saveTabForLater({ url: tabUrl, title: tabTitle });
+      await recordDebtDecision(tabUrl, 'deferred');
     } catch (err) {
       console.error('[tab-out] Failed to save tab:', err);
       showToast('Failed to save tab');
@@ -1358,6 +1859,7 @@ document.addEventListener('click', async (e) => {
     } else {
       await closeTabsByUrls(urls);
     }
+    await recordDebtDecisionBatch(urls, 'closed');
 
     if (card) {
       playCloseSound();
@@ -1383,6 +1885,7 @@ document.addEventListener('click', async (e) => {
     if (urls.length === 0) return;
 
     await closeDuplicateTabs(urls, true);
+    await recordDebtDecisionBatch(urls, 'closed');
     playCloseSound();
 
     // Hide the dedup button
@@ -1404,8 +1907,6 @@ document.addEventListener('click', async (e) => {
           setTimeout(() => badge.remove(), 200);
         }
       });
-      card.classList.remove('has-amber-bar');
-      card.classList.add('has-neutral-bar');
     }
 
     showToast('Closed duplicates, kept one copy each');
@@ -1414,10 +1915,11 @@ document.addEventListener('click', async (e) => {
 
   // ---- Close ALL open tabs ----
   if (action === 'close-all-open-tabs') {
-    const allUrls = openTabs
-      .filter(t => t.url && !t.url.startsWith('chrome') && !t.url.startsWith('about:'))
-      .map(t => t.url);
-    await closeTabsByUrls(allUrls);
+    const realTabs = getRealTabs();
+    const allUrls = realTabs.map(t => t.url).filter(Boolean);
+    const allIds = realTabs.map(t => t.id).filter(id => typeof id === 'number');
+    await recordDebtDecisionBatch(allUrls, 'closed');
+    await closeTabsByIds(allIds);
     playCloseSound();
 
     document.querySelectorAll('#openTabsMissions .mission-card').forEach(c => {
@@ -1475,8 +1977,105 @@ document.addEventListener('input', async (e) => {
   }
 });
 
+/* ----------------------------------------------------------------
+   HOVER TOOLTIP — detailed tab health insights
+   ---------------------------------------------------------------- */
+
+function ensureTabInsightTooltip() {
+  let tooltip = document.getElementById('tabInsightTooltip');
+  if (tooltip) return tooltip;
+
+  tooltip = document.createElement('div');
+  tooltip.id = 'tabInsightTooltip';
+  tooltip.className = 'tab-insight-tooltip';
+  tooltip.style.display = 'none';
+  document.body.appendChild(tooltip);
+  return tooltip;
+}
+
+function buildTabInsightHtml(chipEl) {
+  const title = chipEl.dataset.tooltipTabTitle || 'Untitled';
+  const debtScore = Number(chipEl.dataset.debtScore || 0);
+  const healthScore = Number(chipEl.dataset.healthScore || 0);
+  const openedAt = Number(chipEl.dataset.openedAt || 0);
+  const activeMs = Number(chipEl.dataset.activeMs || 0);
+  const inactivityScore = Number(chipEl.dataset.inactivityScore || 0);
+  const duplicateScore = Number(chipEl.dataset.duplicateScore || 0);
+  const ageScore = Number(chipEl.dataset.ageScore || 0);
+  const homepageScore = Number(chipEl.dataset.homepageScore || 0);
+  const overloadScore = Number(chipEl.dataset.domainOverloadScore || 0);
+  const adaptiveAdjustment = Number(chipEl.dataset.adaptiveAdjustment || 0);
+
+  return `
+    <div class="tooltip-title">${title}</div>
+    <div class="tooltip-grid">
+      <div>健康分</div><div>${healthScore}</div>
+      <div>债务分</div><div>${debtScore}</div>
+      <div>打开时间</div><div>${formatDateTime(openedAt)}</div>
+      <div>活跃时长</div><div>${formatActiveTime(activeMs)}</div>
+    </div>
+    <div class="tooltip-divider"></div>
+    <div class="tooltip-subtitle">评分构成</div>
+    <div class="tooltip-grid tooltip-grid-compact">
+      <div>不活跃</div><div>${inactivityScore}</div>
+      <div>重复页</div><div>${duplicateScore}</div>
+      <div>存活时长</div><div>${ageScore}</div>
+      <div>首页噪声</div><div>${homepageScore}</div>
+      <div>域名过载</div><div>${overloadScore}</div>
+      <div>自适应修正</div><div>${adaptiveAdjustment > 0 ? '+' : ''}${adaptiveAdjustment}</div>
+    </div>
+  `;
+}
+
+function positionTabInsightTooltip(tooltip, evt) {
+  const offset = 14;
+  const maxX = window.innerWidth - tooltip.offsetWidth - 12;
+  const maxY = window.innerHeight - tooltip.offsetHeight - 12;
+  const x = Math.min(maxX, evt.clientX + offset);
+  const y = Math.min(maxY, evt.clientY + offset);
+  tooltip.style.left = `${Math.max(12, x)}px`;
+  tooltip.style.top = `${Math.max(12, y)}px`;
+}
+
+document.addEventListener('mouseover', (e) => {
+  const chip = e.target.closest('.page-chip[data-debt-score]');
+  if (!chip) return;
+  const tooltip = ensureTabInsightTooltip();
+  tooltip.innerHTML = buildTabInsightHtml(chip);
+  tooltip.style.display = 'block';
+  positionTabInsightTooltip(tooltip, e);
+});
+
+document.addEventListener('mousemove', (e) => {
+  const tooltip = document.getElementById('tabInsightTooltip');
+  if (!tooltip || tooltip.style.display === 'none') return;
+  positionTabInsightTooltip(tooltip, e);
+});
+
+document.addEventListener('mouseout', (e) => {
+  const chip = e.target.closest('.page-chip[data-debt-score]');
+  if (!chip) return;
+  const next = e.relatedTarget;
+  if (next && chip.contains(next)) return;
+  const tooltip = document.getElementById('tabInsightTooltip');
+  if (!tooltip) return;
+  tooltip.style.display = 'none';
+});
+
 
 /* ----------------------------------------------------------------
    INITIALIZE
    ---------------------------------------------------------------- */
-renderDashboard();
+requestDashboardRefresh();
+
+window.addEventListener('focus', () => {
+  requestDashboardRefresh();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) requestDashboardRefresh();
+});
+
+window.addEventListener('pageshow', () => {
+  requestDashboardRefresh();
+});
